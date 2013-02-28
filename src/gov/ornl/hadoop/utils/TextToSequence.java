@@ -30,15 +30,15 @@ import org.apache.mahout.common.commandline.DefaultOptionCreator;
 import org.apache.mahout.math.DenseVector;
 import org.apache.mahout.math.VectorWritable;
 
-/*
+/**
  * Convert a delimited text file to a Mahout sequence file format.
- * Usage:
- * Usage:                                                                          
- * [--input <input> --output <output> --delim <delim>]                            
- * Options                                                                         
- *   --input (-i) input      Path to job input directory.                          
- *   --output (-o) output    The directory pathname for output.                    
- *   --delim (-dl) delim     Delimiter for columns.  Default is , (<COMMA>)  
+ * 
+ * Usage:\                                                                          
+ * [--input \<input\> --output \<output\> --delim <delim>] <br>                            
+ * Options                                                <br>                         
+ *   --input (-i) input      Path to job input directory.  <br>                        
+ *   --output (-o) output    The directory pathname for output. <br>                   
+ *   --delim (-dl) delim     Delimiter for columns.  Default is , (\<COMMA\>)<br>  
  * 
  * @author chandola
  */
@@ -46,6 +46,13 @@ import org.apache.mahout.math.VectorWritable;
 public class TextToSequence extends AbstractJob
 {
 
+	
+	/**
+	 * Runs the TextToSequence tool.
+	 * 
+	 * @param args
+	 * @throws Exception
+	 */
 	public static void main(String[] args) throws Exception 
 	{
 		ToolRunner.run(new TextToSequence(), args);
