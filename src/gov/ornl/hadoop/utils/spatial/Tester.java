@@ -1,7 +1,6 @@
 package gov.ornl.hadoop.utils.spatial;
 
-import gpchange.CovFunction;
-import gpchange.CovSEEPNoiseiso;
+import gov.ornl.gpchange.CovFunction;
 
 public class Tester
 {
@@ -15,8 +14,6 @@ public class Tester
 		CovFunction cse;
 		try
 		{
-			Class c = Class.forName(funcName);
-			System.out.println(c.getName());
 			cse = (CovFunction) Class.forName(funcName).newInstance();
 			System.out.println(cse.getNumParams());
 		} catch (InstantiationException | IllegalAccessException

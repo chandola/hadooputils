@@ -1,13 +1,9 @@
 package gov.ornl.hadoop.utils.spatial;
 
 
-import gpchange.CovSEEPNoiseiso;
-import gpchange.EWMASmoother;
-import gpchange.GPChange;
-import gpchange.GPMonitor;
-import gpchange.SpatialSmoother;
+import gov.ornl.gpchange.CovFunction;
+import gov.ornl.gpchange.GPChange;
 
-import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.util.Properties;
@@ -45,7 +41,7 @@ import org.apache.mahout.math.VectorWritable;
 import com.google.common.base.Preconditions;
 
 /**
- * Runs a time series change detection tool on spatial data.
+ * Runs a Gaussian Process training tool on spatial data.
  * 
  * Usage:\                                                                          
  * [--input \<input\> --output \<output\> --numCols numcols --delim delimiter --props /<properties/>] <br> 
@@ -64,7 +60,7 @@ public class ChangeDetection extends AbstractJob
 
 	
 	/**
-	 * Runs the ChangeDetection tool.
+	 * Runs the GPTrain tool.
 	 * 
 	 * @param args
 	 * @throws Exception
@@ -84,7 +80,7 @@ public class ChangeDetection extends AbstractJob
 			URI[] localFiles = DistributedCache.getCacheFiles(conf);
 			Preconditions.checkArgument(localFiles != null && localFiles.length >= 1, 
 					"missing paths from the DistributedCache");
-			props = loadProperties(localFiles[0].toString(),conf);
+			props = Utilities.loadProperties(localFiles[0].toString(),conf);
 		}
 		
 		public void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
@@ -107,22 +103,22 @@ public class ChangeDetection extends AbstractJob
 			{
 				float x = Float.parseFloat(tokens[0]);
 				float y = Float.parseFloat(tokens[1]);
-				if(ChangeDetection.isSpatialValid(x,y,ltX,ltY,rbX,rbY))
+				if(Utilities.isSpatialValid(x,y,ltX,ltY,rbX,rbY))
 				{
-					int xInd = (int) Math.ceil(x/xBinWidth);
-					int yInd = (int) Math.ceil(y/yBinWidth);
+					int xInd = (int) Math.floor(Math.abs(x - ltX)/xBinWidth);
+					int yInd = (int) Math.floor(Math.abs(y - ltY)/yBinWidth);
 					IntPairWritable pair = new IntPairWritable(xInd,yInd);
-					DenseVector vector = new DenseVector(numCols);
-					for(int i = 0; i < numCols; i++)
-						vector.set(i, Double.parseDouble(tokens[i]));
+					DenseVector vector = new DenseVector(numCols - 2);
+					for(int i = 2; i < numCols; i++)
+						vector.set(i-2, Double.parseDouble(tokens[i]));
 					//normalize this vector
 					DenseVector sVector;
 					if(norm == null || norm.compareToIgnoreCase("identity") == 0)
 						sVector = vector;
 					else if(norm.compareToIgnoreCase("center") == 0)
-						sVector = (DenseVector) ChangeDetection.center(vector,2);
+						sVector = (DenseVector) Utilities.center(vector,0);
 					else if(norm.compareToIgnoreCase("zscore") == 0)
-						sVector = (DenseVector) ChangeDetection.standardize(vector,2);
+						sVector = (DenseVector) Utilities.standardize(vector,0);
 					else
 						sVector = vector;
 					//detect changes
@@ -142,20 +138,22 @@ public class ChangeDetection extends AbstractJob
 			URI[] localFiles = DistributedCache.getCacheFiles(conf);
 			Preconditions.checkArgument(localFiles != null && localFiles.length >= 1, 
 					"missing paths from the DistributedCache");
-			props = loadProperties(localFiles[0].toString(),conf);
+			props = Utilities.loadProperties(localFiles[0].toString(),conf);
 		}
 		
 		public void reduce(IntPairWritable key, Iterable<VectorWritable> values, Context context) throws IOException, InterruptedException 
 		{
-			//get initial hyper-parameters
 			java.util.Vector<Vector> data = new java.util.Vector<Vector> ();
 			for(VectorWritable v: values)
-				data.add(v.get());
-			java.util.Vector<Vector> changes = ChangeDetection.detectChanges(data,props);
-			for(Vector v: changes)
 			{
-				context.write(key,new VectorWritable(v));
+				data.add(v.get());
 			}
+			Vector loghyper = ChangeDetection.train(data,props);
+			
+			if(loghyper != null)
+				context.write(key,new VectorWritable(loghyper));
+			else
+				throw new IllegalArgumentException("Missing Configuation Parameters");
 		}
 	}
 	
@@ -221,7 +219,12 @@ public class ChangeDetection extends AbstractJob
 			Path inputDir = new Path((String) cmdLine.getValue(inputDirOpt));			
 			Path outputDir = new Path((String) cmdLine.getValue(outputDirOpt));
 			
-			Job job = new Job(config, "ChangeDetection");
+			FileSystem fs = FileSystem.get(config);
+			if(fs.exists(outputDir))
+				fs.delete(outputDir,true);
+				
+		
+			Job job = new Job(config, "GPTrain");
 			job.setJarByClass(ChangeDetection.class);
 
 			job.setMapperClass(Map.class);
@@ -237,7 +240,6 @@ public class ChangeDetection extends AbstractJob
 			FileInputFormat.addInputPath(job, inputDir);
 			FileOutputFormat.setOutputPath(job, outputDir);
 			job.waitForCompletion(true);
-
 		} 
 		catch (OptionException e) 
 		{
@@ -249,65 +251,58 @@ public class ChangeDetection extends AbstractJob
 	}
 	
 	/**
-	 * Learn GPChange hyper-parameters from data.
+	 * Run training algorithm on data.
 	 * 
 	 * @param data
 	 * @param props
-	 * @return Vector of hyper parameters
+	 * @return Vector of log of hyperparameters
 	 */
-	public static java.util.Vector<Vector> detectChanges(
-			java.util.Vector<Vector> data, Properties props) 
+	public static Vector train(
+			java.util.Vector<Vector> data, Properties props) throws IllegalArgumentException
 	{
 		double [] logHypers = ChangeDetection.getLogHypers(props);
+		if(logHypers == null)
+		{
+			throw new IllegalArgumentException("Could not read hyperparameters");
+		}
+		if(props.getProperty("cycle") == null || 
+				props.getProperty("trainLength") == null || 
+				props.getProperty("runLength") == null || 
+				props.getProperty("covFunction") == null)
+		{
+			throw new IllegalArgumentException("Missing parameters.");
+		}
 		int cycle = Integer.parseInt(props.getProperty("cycle"));
-        CovSEEPNoiseiso cse = new CovSEEPNoiseiso(logHypers,logHypers.length);
+		String funcName = props.getProperty("covFunction");
+		CovFunction cse;
+		try
+		{			
+			cse = (CovFunction) Class.forName(funcName).newInstance();
+		} catch (InstantiationException | IllegalAccessException
+				| ClassNotFoundException e)
+		{
+			throw new IllegalArgumentException("Could not construct covariance function.");
+		}
+		if(cse.retNumParams() != logHypers.length)
+			return null;
+		cse.setLogHypers(logHypers);
+		cse.setNumParams(logHypers.length);
+        
         GPChange gpc = new GPChange(cse);
-        //1. train
-        String trainFlag = props.getProperty("train");
-        if(trainFlag != null && trainFlag.compareToIgnoreCase("true") == 0)
-        {
-            int trainLength = Integer.parseInt(props.getProperty("trainLength"));
-        	int runLength = Integer.parseInt(props.getProperty("runLength"));
-    		double[][] trainData = new double[trainLength][data.size()];
-    		for(int i = 0 ; i < data.size(); i++)
-    			for(int j = 0; j < trainLength; j++)
-    				trainData[j][i] = data.get(i).get(j);
-    		gpc.train(trainData, runLength, -1, 1, trainLength, cycle);
-        }
-		//2. test
-        double alpha = 0.01;
-        int length = data.get(0).size();
-		double[][] testData = new double[length][data.size()];
+        int trainLength = Integer.parseInt(props.getProperty("trainLength"));
+    	int runLength = Integer.parseInt(props.getProperty("runLength"));
+		double[][] trainData = new double[trainLength][data.size()];
 		for(int i = 0 ; i < data.size(); i++)
-			for(int j = 0; j < length; j++)
-				testData[j][i] = data.get(i).get(j);
-		//3. monitor
-        if(props.getProperty("alpha") != null)
-        	alpha = Double.parseDouble(props.getProperty("alpha"));
-        //monitor from the first observation
-        GPMonitor gpm = gpc.monitor(testData, data.size(), cycle, alpha, null, 1);
-        //4. temporal smoothing
-        EWMASmoother smoother = new EWMASmoother();
-        double lambdaHigh = Double.parseDouble(props.getProperty("lambdaHigh"));
-        double lambdaLow = Double.parseDouble(props.getProperty("lambdaLow"));
-        int mHigh = Integer.parseInt(props.getProperty("mHigh"));
-        int mLow = Integer.parseInt(props.getProperty("mLow"));
-        smoother.smooth(gpm.getZ(),lambdaHigh, lambdaLow, mHigh, mLow, 1);
-        int[][] alarms = smoother.getAlarms();
-        //5. spatial smoothing
-        int spatialMethod = Integer.parseInt(props.getProperty("spatialMethod"));
-        int spatialNeighborhood = Integer.parseInt(props.getProperty("spatialNeighborhood"));
-        double spatialFraction = Double.parseDouble(props.getProperty("spatialFraction"));
-        //create spatial matrix for smoothing
-        for(int i = 0; i < length; i++)
-        {
-        	
-        }
-        SpatialSmoother.smooth(smoother.getAlarms(), spatialNeighborhood, spatialMethod, spatialFraction);
-        //6. cycle average
-        //for(int i = 0; i < )
-		
-        return data;
+			for(int j = 0; j < trainLength; j++)
+				trainData[j][i] = data.get(i).get(j);
+		gpc.train(trainData, runLength, 1, 1, 1, cycle);
+		DenseVector vLogHypers = new DenseVector(logHypers.length);
+		logHypers = gpc.getCovFunc().getLogHypers();
+    	for(int i = 0; i < logHypers.length; i++)
+    	{
+    		vLogHypers.set(i, logHypers[i]);
+    	}
+        return vLogHypers;
 	}
 
 	/**
@@ -336,103 +331,5 @@ public class ChangeDetection extends AbstractJob
 			return params;
 		}
 		return null;
-	}
-
-	/**
-	 * Standardize values of a vector starting with index s
-	 * 
-	 * @param vector - vector to be standardized
-	 * @param s - starting index (starts with 0)
-	 */
-	public static Vector standardize(Vector vector, int s) 
-	{
-		double mean = 0, std = 0;
-		for(int i = s; i < vector.size(); i++)
-			mean += vector.get(i);
-		
-		mean /= (vector.size() - s);
-		for(int i = s; i < vector.size(); i++)
-			std += Math.pow(vector.get(i)-mean,2);
-		std /= (vector.size() - s);
-		std = Math.sqrt(std);
-		if(std == 0) std = 1;
-		Vector sVector = vector.clone();
-		for(int i = s; i < vector.size(); i++)
-			sVector.set(i, (vector.get(i) - mean)/std);
-		return sVector;
-	}
-	
-	/**
-	 * Center values of a vector to zero mean
-	 * 
-	 * @param vector - vector to be centered
-	 * @param s - starting index (starts with 0)
-	 */
-	public static Vector center(Vector vector, int s) 
-	{
-		double mean = 0, std = 0;
-		for(int i = s; i < vector.size(); i++)
-			mean += vector.get(i);
-		
-		mean /= (vector.size() - s);
-		for(int i = s; i < vector.size(); i++)
-			std += Math.pow(vector.get(i)-mean,2);
-		std /= (vector.size() - s);
-		std = Math.sqrt(std);
-		if(std == 0) std = 1;
-		Vector sVector = vector.clone();
-		for(int i = s; i < vector.size(); i++)
-			sVector.set(i, (vector.get(i) - mean)/std);
-		return sVector;
-	}
-
-	/**
-	 * Checks if a given point is inside the spatial bounding box.
-	 * 
-	 * @param x - x coordinate of query point
-	 * @param y - y coordinate of query point
-	 * @param ltX - x coordinate of top left corner of the bounding box
-	 * @param ltY - y coordinate of top left corner of the bounding box
-	 * @param rbX - x coordinate of bottom right corner of the bounding box
-	 * @param rbY - y coordinate of bottom right corner of the bounding box
-	 * @return true if point is within the box, false otherwise
-	 */
-	public static boolean isSpatialValid(float x, float y, float ltX, float ltY, float rbX, float rbY) 
-	{
-		boolean xFlag,yFlag;
-		if(ltX < rbX)
-			xFlag = ltX <= x && rbX >= x;
-		else
-			xFlag = rbX <= x && ltX >= x;
-		if(ltY < rbY)
-			yFlag = ltY <= y && rbY >= y;
-		else
-			yFlag = rbY <= y && ltY >= y;
-		return xFlag && yFlag;
-	}
-	
-	/**
-	 * Load properties files
-	 * 
-	 * @param propsFile
-	 * @param config
-	 * @return {@link Properties} object
-	 */
-	public static Properties loadProperties(String propsFile, Configuration config)
-	{
-		try
-		{
-			FileSystem fs = FileSystem.get(config);	
-			BufferedInputStream in = new BufferedInputStream(fs.open(new Path(propsFile)));
-			Properties props = new Properties();
-			props.load(in);
-			return props;
-		}
-		catch(IOException e)
-		{
-			System.err.println("IO Error");
-			e.printStackTrace();
-			return null;
-		}
 	}
 }

@@ -1,11 +1,13 @@
 package gov.ornl.hadoop.utils.spatial;
 
 
-import gov.ornl.gpchange.CovFunction;
-import gov.ornl.gpchange.GPChange;
+import gov.ornl.gpchange.CovSEEPNoiseiso;
+import gov.ornl.gpchange.GPMonitor;
+import gov.ornl.hadoop.utils.IntPair;
 
 import java.io.IOException;
 import java.net.URI;
+import java.util.HashMap;
 import java.util.Properties;
 
 import org.apache.commons.cli2.CommandLine;
@@ -18,9 +20,11 @@ import org.apache.commons.cli2.builder.GroupBuilder;
 import org.apache.commons.cli2.commandline.Parser;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.filecache.DistributedCache;
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.SequenceFile;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.Mapper;
@@ -41,7 +45,7 @@ import org.apache.mahout.math.VectorWritable;
 import com.google.common.base.Preconditions;
 
 /**
- * Runs a Gaussian Process training tool on spatial data.
+ * Runs a time series change detection tool on spatial data.
  * 
  * Usage:\                                                                          
  * [--input \<input\> --output \<output\> --numCols numcols --delim delimiter --props /<properties/>] <br> 
@@ -55,19 +59,19 @@ import com.google.common.base.Preconditions;
  * @author chandola
  */
 
-public class GPTrain extends AbstractJob
+public class GPChange extends AbstractJob
 {
 
 	
 	/**
-	 * Runs the GPTrain tool.
+	 * Runs the ChangeDetection tool.
 	 * 
 	 * @param args
 	 * @throws Exception
 	 */
 	public static void main(String[] args) throws Exception 
 	{
-		ToolRunner.run(new GPTrain(), args);
+		ToolRunner.run(new GPChange(), args);
 	}
 
 	public static class Map extends Mapper<LongWritable, Text, IntPairWritable, VectorWritable> 
@@ -77,6 +81,7 @@ public class GPTrain extends AbstractJob
 		protected void setup(Context context) throws IOException, InterruptedException {
 			super.setup(context);
 			Configuration conf = context.getConfiguration();
+			//load properties
 			URI[] localFiles = DistributedCache.getCacheFiles(conf);
 			Preconditions.checkArgument(localFiles != null && localFiles.length >= 1, 
 					"missing paths from the DistributedCache");
@@ -103,25 +108,25 @@ public class GPTrain extends AbstractJob
 			{
 				float x = Float.parseFloat(tokens[0]);
 				float y = Float.parseFloat(tokens[1]);
-				if(Utilities.isSpatialValid(x,y,ltX,ltY,rbX,rbY))
+				if(GPChange.isSpatialValid(x,y,ltX,ltY,rbX,rbY))
 				{
 					int xInd = (int) Math.floor(Math.abs(x - ltX)/xBinWidth);
 					int yInd = (int) Math.floor(Math.abs(y - ltY)/yBinWidth);
 					IntPairWritable pair = new IntPairWritable(xInd,yInd);
-					DenseVector vector = new DenseVector(numCols - 2);
-					for(int i = 2; i < numCols; i++)
-						vector.set(i-2, Double.parseDouble(tokens[i]));
+					DenseVector vector = new DenseVector(numCols);
+					for(int i = 0; i < numCols; i++)
+						vector.set(i, Double.parseDouble(tokens[i]));
 					//normalize this vector
 					DenseVector sVector;
 					if(norm == null || norm.compareToIgnoreCase("identity") == 0)
 						sVector = vector;
 					else if(norm.compareToIgnoreCase("center") == 0)
-						sVector = (DenseVector) Utilities.center(vector,0);
+						sVector = (DenseVector) Utilities.center(vector,2);
 					else if(norm.compareToIgnoreCase("zscore") == 0)
-						sVector = (DenseVector) Utilities.standardize(vector,0);
+						sVector = (DenseVector) Utilities.standardize(vector,2);
 					else
 						sVector = vector;
-					//detect changes
+					
 					context.write(pair,new VectorWritable(sVector));
 				}
 			}
@@ -131,6 +136,7 @@ public class GPTrain extends AbstractJob
 	public static class Reduce extends Reducer<IntPairWritable, VectorWritable, IntPairWritable, VectorWritable>
 	{
 		Properties props;
+		HashMap<IntPair, Vector> logHyperVector = null;
 		@Override
 		protected void setup(Context context) throws IOException, InterruptedException {
 			super.setup(context);
@@ -139,6 +145,10 @@ public class GPTrain extends AbstractJob
 			Preconditions.checkArgument(localFiles != null && localFiles.length >= 1, 
 					"missing paths from the DistributedCache");
 			props = Utilities.loadProperties(localFiles[0].toString(),conf);
+			//load model hyperparameters
+			if(localFiles.length > 1)
+				logHyperVector = GPChange.loadLogHypers(localFiles[1].toString(), conf);
+
 		}
 		
 		public void reduce(IntPairWritable key, Iterable<VectorWritable> values, Context context) throws IOException, InterruptedException 
@@ -148,12 +158,11 @@ public class GPTrain extends AbstractJob
 			{
 				data.add(v.get());
 			}
-			Vector loghyper = GPTrain.train(data,props);
-			
-			if(loghyper != null)
-				context.write(key,new VectorWritable(loghyper));
-			else
-				throw new IllegalArgumentException("Missing Configuation Parameters");
+			java.util.Vector<Vector> changes = GPChange.detectChanges(key,data,props,logHyperVector,2);
+			for(Vector v: changes)
+			{
+				context.write(key,new VectorWritable(v));
+			}
 		}
 	}
 	
@@ -176,6 +185,10 @@ public class GPTrain extends AbstractJob
 		Option propsOpt = obuilder.withLongName("props").withRequired(false).withArgument(
 				abuilder.withMinimum(1).withMaximum(1).withName("props").create()).withDescription(
 						"Location of properties file.").withShortName("p").create();
+		Option modelFileOpt = obuilder.withLongName("modelFile").withRequired(false).withArgument(
+				abuilder.withMinimum(1).withMaximum(1).withName("modelFile").create()).withDescription(
+						"Location of file with hyperparameters.").withShortName("mf").create();
+				
 		Option helpOpt = obuilder.withLongName("help").withDescription("Print out help").withShortName("h")
 				.create();
 		
@@ -185,6 +198,7 @@ public class GPTrain extends AbstractJob
 				withOption(outputDirOpt).
 				withOption(propsOpt).
 				withOption(delimOpt).
+				withOption(modelFileOpt).
 				create();
 		
 		try
@@ -214,18 +228,21 @@ public class GPTrain extends AbstractJob
 			config.set("delim",delim);
 			config.setInt("numCols", numCols);
 			Path propsFile = new Path((String) cmdLine.getValue(propsOpt));			
-			DistributedCache.setCacheFiles(new URI[] {propsFile.toUri()}, config);
+			DistributedCache.addCacheFile(propsFile.toUri(), config);
+			if(cmdLine.hasOption(modelFileOpt))
+			{
+				Path modelFile = new Path((String) cmdLine.getValue(modelFileOpt));
+				DistributedCache.addCacheFile(modelFile.toUri(), config);
+			}
 			
 			Path inputDir = new Path((String) cmdLine.getValue(inputDirOpt));			
 			Path outputDir = new Path((String) cmdLine.getValue(outputDirOpt));
-			
 			FileSystem fs = FileSystem.get(config);
 			if(fs.exists(outputDir))
 				fs.delete(outputDir,true);
-				
-		
-			Job job = new Job(config, "GPTrain");
-			job.setJarByClass(GPTrain.class);
+			
+			Job job = new Job(config, "ChangeDetection");
+			job.setJarByClass(GPChange.class);
 
 			job.setMapperClass(Map.class);
 			job.setReducerClass(Reduce.class);
@@ -240,6 +257,7 @@ public class GPTrain extends AbstractJob
 			FileInputFormat.addInputPath(job, inputDir);
 			FileOutputFormat.setOutputPath(job, outputDir);
 			job.waitForCompletion(true);
+
 		} 
 		catch (OptionException e) 
 		{
@@ -251,58 +269,59 @@ public class GPTrain extends AbstractJob
 	}
 	
 	/**
-	 * Run training algorithm on data.
+	 * Learn GPChange hyper-parameters from data.
 	 * 
+	 * @param key
 	 * @param data
 	 * @param props
-	 * @return Vector of log of hyperparameters
+	 * @param logHyperVector
+	 * @param startIndex
+	 * @return Vector of hyper parameters
 	 */
-	public static Vector train(
-			java.util.Vector<Vector> data, Properties props) throws IllegalArgumentException
+	public static java.util.Vector<Vector> detectChanges(
+			IntPairWritable key, java.util.Vector<Vector> data, Properties props, HashMap<IntPair, Vector> logHyperVector, int startIndex) 
 	{
-		double [] logHypers = GPTrain.getLogHypers(props);
+		double [] logHypers = null;
+		
+		if(logHyperVector != null)
+		{
+			IntPair p = new IntPair(key.getFirst(),key.getSecond());
+			Vector vec = logHyperVector.get(p);
+			if(vec != null)
+			{
+				logHypers = new double[vec.size()];
+				for(int i = 0; i < vec.size(); i++)
+					logHypers[i] = vec.get(i);					
+			}
+		}
 		if(logHypers == null)
-		{
-			throw new IllegalArgumentException("Could not read hyperparameters");
-		}
-		if(props.getProperty("cycle") == null || 
-				props.getProperty("trainLength") == null || 
-				props.getProperty("runLength") == null || 
-				props.getProperty("covFunction") == null)
-		{
-			throw new IllegalArgumentException("Missing parameters.");
-		}
+			logHypers = GPChange.getLogHypers(props);
 		int cycle = Integer.parseInt(props.getProperty("cycle"));
-		String funcName = props.getProperty("covFunction");
-		CovFunction cse;
-		try
-		{			
-			cse = (CovFunction) Class.forName(funcName).newInstance();
-		} catch (InstantiationException | IllegalAccessException
-				| ClassNotFoundException e)
-		{
-			throw new IllegalArgumentException("Could not construct covariance function.");
-		}
-		if(cse.retNumParams() != logHypers.length)
-			return null;
-		cse.setLogHypers(logHypers);
-		cse.setNumParams(logHypers.length);
-        
-        GPChange gpc = new GPChange(cse);
-        int trainLength = Integer.parseInt(props.getProperty("trainLength"));
-    	int runLength = Integer.parseInt(props.getProperty("runLength"));
-		double[][] trainData = new double[trainLength][data.size()];
+        CovSEEPNoiseiso cse = new CovSEEPNoiseiso(logHypers,logHypers.length);
+        gov.ornl.gpchange.GPChange gpc = new gov.ornl.gpchange.GPChange(cse);
+        int length = data.get(0).size() - startIndex;
+		double[][] testData = new double[length][data.size()];
 		for(int i = 0 ; i < data.size(); i++)
-			for(int j = 0; j < trainLength; j++)
-				trainData[j][i] = data.get(i).get(j);
-		gpc.train(trainData, runLength, 1, 1, 1, cycle);
-		DenseVector vLogHypers = new DenseVector(logHypers.length);
-		logHypers = gpc.getCovFunc().getLogHypers();
-    	for(int i = 0; i < logHypers.length; i++)
-    	{
-    		vLogHypers.set(i, logHypers[i]);
-    	}
-        return vLogHypers;
+			for(int j = 0; j < length; j++)
+				testData[j][i] = data.get(i).get(j+startIndex);
+        double alpha = 0.01;
+        if(props.getProperty("alpha") != null)
+        	alpha = Double.parseDouble(props.getProperty("alpha"));
+        //monitor from the first observation
+        GPMonitor gpm = gpc.monitor(testData, data.size(), cycle, alpha, null, 1);
+        double[][] z = gpm.getZ();
+        java.util.Vector<Vector> vector = new java.util.Vector<Vector>(data.size());
+        for(int i = 0; i < data.size(); i++)
+        {
+        	DenseVector dv = new DenseVector(length+startIndex);
+        	for(int j = 0; j < startIndex; j++)
+        		dv.set(j,data.get(i).get(j));
+        	for(int j = startIndex; j < length+startIndex; j++)
+        		dv.set(j,z[j-startIndex][i]);
+        	vector.add(dv);
+        }
+
+        return vector;
 	}
 
 	/**
@@ -329,6 +348,75 @@ public class GPTrain extends AbstractJob
 			}
 			
 			return params;
+		}
+		return null;
+	}
+
+	/**
+	 * Checks if a given point is inside the spatial bounding box.
+	 * 
+	 * @param x - x coordinate of query point
+	 * @param y - y coordinate of query point
+	 * @param ltX - x coordinate of top left corner of the bounding box
+	 * @param ltY - y coordinate of top left corner of the bounding box
+	 * @param rbX - x coordinate of bottom right corner of the bounding box
+	 * @param rbY - y coordinate of bottom right corner of the bounding box
+	 * @return true if point is within the box, false otherwise
+	 */
+	public static boolean isSpatialValid(float x, float y, float ltX, float ltY, float rbX, float rbY) 
+	{
+		boolean xFlag,yFlag;
+		if(ltX < rbX)
+			xFlag = ltX <= x && rbX >= x;
+		else
+			xFlag = rbX <= x && ltX >= x;
+		if(ltY < rbY)
+			yFlag = ltY <= y && rbY >= y;
+		else
+			yFlag = rbY <= y && ltY >= y;
+		return xFlag && yFlag;
+	}
+	
+	/**
+	 * Load loghypers file
+	 * 
+	 * @param logHyperFile
+	 * @param config
+	 * @return {@ HashMap} object mapping (xbin,ybin) to the loghypers
+	 */
+	public static HashMap<IntPair, Vector> loadLogHypers(String logHyperFile, Configuration config)
+	{
+		try
+		{
+			Path[] paths;
+			FileSystem fs = FileSystem.get(config);
+			if(fs.isFile(new Path(logHyperFile)))
+			{
+				paths = new Path[]{new Path(logHyperFile)};
+			}
+			else
+			{
+				FileStatus[] files = fs.globStatus(new Path(logHyperFile+"/part-*"));
+				paths = new Path[files.length];
+				for(int i = 0; i < files.length; i++)
+				{
+					paths[i] = files[i].getPath();
+				}
+			}
+			HashMap<IntPair, Vector> logHyperVector = new HashMap<IntPair, Vector>(); 
+			for(Path p: paths)
+			{
+				SequenceFile.Reader reader = new SequenceFile.Reader(FileSystem.get(config), p, config);
+				IntPairWritable key = (IntPairWritable) reader.getKeyClass().newInstance();
+				VectorWritable value = (VectorWritable) reader.getValueClass().newInstance();
+				while(reader.next(key,value))
+					logHyperVector.put(new IntPair(key.getFirst(),key.getSecond()),value.get());
+				reader.close();
+			}
+			return logHyperVector;
+		} catch (Exception e)
+		{			
+			e.printStackTrace();
 		}
 		return null;
 	}
