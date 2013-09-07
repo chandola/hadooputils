@@ -16,8 +16,7 @@ public class Tester
 		{
 			cse = (CovFunction) Class.forName(funcName).newInstance();
 			System.out.println(cse.getNumParams());
-		} catch (InstantiationException | IllegalAccessException
-				| ClassNotFoundException e)
+		} catch (Exception e)
 		{
 			throw new IllegalArgumentException("Could not construct covariance function.");
 		}

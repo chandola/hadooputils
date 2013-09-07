@@ -278,8 +278,7 @@ public class GPTrain extends AbstractJob
 		try
 		{			
 			cse = (CovFunction) Class.forName(funcName).newInstance();
-		} catch (InstantiationException | IllegalAccessException
-				| ClassNotFoundException e)
+		} catch (Exception e)
 		{
 			throw new IllegalArgumentException("Could not construct covariance function.");
 		}
